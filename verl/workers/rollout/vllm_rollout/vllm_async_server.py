@@ -831,10 +831,8 @@ class vLLMHttpServer:
             elif quantization in ["mxfp8", "ascend"]:
                 # Both mxfp8 and ascend use MXFP8_BLOCK_QUANT_KWARGS
                 # vllm-ascend will automatically handle layer quant types in dynamic mode
-                from verl.utils.vllm.vllm_fp8_utils import MXFP8_BLOCK_QUANT_KWARGS
                 # quant_config_kwargs = dict(MXFP8_BLOCK_QUANT_KWARGS)
                 # Use "ascend" as the vllm quantization parameter
-                hf_overrides["quantization_config"] = dict(MXFP8_BLOCK_QUANT_KWARGS)
                 quantization = "ascend"
 
         if quantization is not None and self.config.quantization_config_file is not None:
