@@ -46,6 +46,81 @@ logger = logging.getLogger(__file__)
 logger.setLevel(os.getenv("VERL_LOGGING_LEVEL", "WARN"))
 
 
+def find_repetition_offset_and_window(tokens, min_repeats=3):
+    """
+    Finds the starting index (offset) and N-gram window size of a trailing repetition.
+    Runs in O(N) time by anchoring on the final token.
+    """
+    n = len(tokens)
+    if n < min_repeats:
+        return False, None
+
+    last_token = tokens[-1]
+    
+    # 1. Find candidate N-gram sizes (periods)
+    candidate_periods = []
+    for i in range(n - 2, -1, -1):
+        if tokens[i] == last_token:
+            candidate_periods.append(n - 1 - i)
+
+    # 2. Test candidate periods
+    for p in candidate_periods:
+        if n < p * min_repeats:
+            break 
+            
+        tail_block = tokens[-p:]
+        is_valid_period = True
+        
+        for r in range(1, min_repeats):
+            start_idx = -(r + 1) * p
+            end_idx = -r * p
+            if tokens[start_idx:end_idx] != tail_block:
+                is_valid_period = False
+                break
+                
+        if is_valid_period:
+            offset = n - (p * min_repeats)
+            while offset > 0 and tokens[offset - 1] == tokens[offset - 1 + p]:
+                offset -= 1
+            return True, p
+
+    return False, None
+
+# --- The Batch Wrapper ---
+def get_repeated_mask(responses: torch.Tensor, pad_token_id: int = 151643) -> torch.Tensor:
+    """
+    Applies trailing repetition detection to a batched tensor of responses.
+    Ignores padding tokens at the end of sequences.
+    
+    Returns:
+        torch.Tensor: A boolean mask of shape [batch_size, 1]
+    """
+    batch_size = responses.size(0)
+    
+    # Initialize the mask with False
+    repeated_mask = torch.zeros((batch_size, 1), dtype=torch.bool, device=responses.device)
+    
+    for i in range(batch_size):
+        # 1. Get the single sequence row
+        seq = responses[i]
+        
+        # 2. Find the true length by counting tokens that are NOT padding
+        true_length = (seq != pad_token_id).sum().item()
+        
+        # 3. Slice off the padding and convert to a standard Python list
+        # e.g., seq[:true_length] safely removes the trailing 151643 tokens
+        valid_tokens = seq[:true_length].tolist()
+        
+        # 4. Run your O(N) python function on the valid tokens
+        is_repeated, _ = find_repetition_offset_and_window(valid_tokens)
+        
+        # 5. Update the mask if a loop was found
+        if is_repeated:
+            repeated_mask[i, 0] = True
+            
+    return repeated_mask
+
+
 class DataParallelPPOActor(BasePPOActor):
     """FSDP DataParallel PPO Actor or Ref worker
 
@@ -269,6 +344,7 @@ class DataParallelPPOActor(BasePPOActor):
                     )
                     # [Zhijie]
                     top1_probs_rmpad = torch.nn.functional.log_softmax(logits_rmpad, dim=-1).max(dim=-1).values
+                    repeated = get_repeated_mask(micro_batch["responses"], pad_token_id=151643)
                     
                     # compute entropy
                     if calculate_entropy:
@@ -382,9 +458,10 @@ class DataParallelPPOActor(BasePPOActor):
                     logits.div_(temperature)
                     logits = logits[:, -response_length - 1 : -1, :]  # (bsz, response_length, vocab_size)
                     log_probs = logprobs_from_logits(logits, micro_batch["responses"])
-                                        # [Zhijie]
+                    # [Zhijie]
                     top1_probs = torch.nn.functional.log_softmax(logits, dim=-1).max(dim=-1).values
-                    
+                    repeated = get_repeated_mask(micro_batch["responses"], pad_token_id=151643)
+
                     if calculate_entropy:
                         if not self.config.entropy_checkpointing:
                             entropy = verl_F.entropy_from_logits(logits)  # (bsz, response_length)
@@ -398,7 +475,7 @@ class DataParallelPPOActor(BasePPOActor):
                             else torch.utils.checkpoint.checkpoint(self.calculate_sum_pi_squared_from_logits, logits)
                         )
 
-            outputs = {"log_probs": log_probs, "top1_log_probs":top1_probs.detach()}
+            outputs = {"log_probs": log_probs, "top1_log_probs":top1_probs.detach(), "repeated":repeated.detach()}
             if calculate_entropy:
                 outputs["entropys"] = entropy
             if calculate_sum_pi_squared:
@@ -608,6 +685,7 @@ class DataParallelPPOActor(BasePPOActor):
                     log_prob = outputs["log_probs"]
                     # [Zhijie]
                     top1_log_prob = outputs["top1_log_probs"]
+                    repeated = outputs["repeated"]
 
                     entropy = outputs["entropys"] if calculate_entropy else None
 
@@ -640,7 +718,8 @@ class DataParallelPPOActor(BasePPOActor):
                         loss_agg_mode=loss_agg_mode,
                         config=self.config,
                         rollout_is_weights=rollout_is_weights,
-                        top1_log_prob=top1_log_prob
+                        top1_log_prob=top1_log_prob,
+                        repeated=repeated
                     )
                     micro_batch_metrics.update(pg_metrics)
 

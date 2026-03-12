@@ -1172,7 +1172,8 @@ def compute_policy_loss_vanilla(
     loss_agg_mode: str = "token-mean",
     config: Optional[ActorConfig] = None,
     rollout_is_weights: torch.Tensor | None = None,
-    top1_log_prob: torch.Tensor | None = None
+    top1_log_prob: torch.Tensor | None = None,
+    repeated: torch.Tensor | None = None
 ) -> tuple[torch.Tensor, dict[str, Any]]:
     """
     Compute the clipped policy objective and related metrics for PPO.
@@ -1214,6 +1215,17 @@ def compute_policy_loss_vanilla(
         "The lower bound of the clip_ratio_c for dual-clip PPO should be greater than 1.0,"
         + f" but get the value: {clip_ratio_c}."
     )
+
+    # use repeated as a flag to set advantage to zero
+    repeated_count = 0
+    repeated_ratio = 0
+    if repeated is not None:
+        # In-place fill: zeros out the entire row where repeated is True
+        advantages.masked_fill_(repeated, 0.0)
+        repeated_count = repeated.sum().item()
+        repeated_ratio = repeated.float().mean().item()
+
+
     import os
     PI_OLD_ENABLED = int(os.getenv('PI_OLD_ENABLED', '0'))
     TOP1_ENABLED = int(os.getenv('TOP1_ENABLED', '0'))
@@ -1221,7 +1233,7 @@ def compute_policy_loss_vanilla(
         
         ppo_kl = verl_F.masked_mean(-(log_prob - old_log_prob), response_mask)
 
-        old_log_prob = torch.log(torch.exp(old_log_prob) + 0.01)
+        old_log_prob = torch.log(torch.exp(old_log_prob) + 0.001)
         negative_approx_kl = log_prob - old_log_prob
         # Clamp negative_approx_kl for stability
         negative_approx_kl = torch.clamp(negative_approx_kl, min=-20.0, max=20.0)
@@ -1234,6 +1246,8 @@ def compute_policy_loss_vanilla(
         )
         pg_metrics = {
             "actor/ppo_kl": ppo_kl.detach().item(),
+            "actor/repeated_count": repeated_count,
+            "actor/repeated_ratio": repeated_ratio,
         }
         
     else:
@@ -1301,6 +1315,8 @@ def compute_policy_loss_vanilla(
             "actor/pg_clipfrac": pg_clipfrac.detach().item(),
             "actor/ppo_kl": ppo_kl.detach().item(),
             "actor/pg_clipfrac_lower": pg_clipfrac_lower.detach().item(),
+            "actor/repeated_count": repeated_count,
+            "actor/repeated_ratio": repeated_ratio,
         }
     return pg_loss, pg_metrics
 
