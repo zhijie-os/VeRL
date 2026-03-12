@@ -1137,12 +1137,6 @@ def compute_policy_loss(
     ratio = torch.exp(negative_approx_kl)
     ppo_kl = verl_F.masked_mean(-negative_approx_kl, response_mask)
 
-    import os    
-    PIPO_ENABLED = int(os.getenv('PIPO_ENABLED', '0'))
-
-    if PIPO_ENABLED != 0:
-        advantages = torch.where(advantages < 0, (advantages*0-1) * torch.exp(log_prob.detach()),  advantages*0)
-
 
     pg_losses1 = -advantages * ratio
     if cliprange_low is None:
@@ -1163,14 +1157,6 @@ def compute_policy_loss(
         torch.gt(clip_pg_losses1, pg_losses3) * (advantages < 0).float(), response_mask
     )
 
-    ADV_TYPE = int(os.getenv('ADV_TYPE', '0'))
-    if ADV_TYPE == 0:
-        pg_losses = torch.where(advantages < 0, clip_pg_losses2, clip_pg_losses1)
-    elif ADV_TYPE == 1: # only want the bad samples
-        pg_losses = torch.where(advantages < 0, clip_pg_losses2, clip_pg_losses1*0)
-    else:   # only want the good samples
-        pg_losses = torch.where(advantages < 0, clip_pg_losses2*0, clip_pg_losses1)
-
     # pg_losses = torch.where(advantages < 0, clip_pg_losses2, clip_pg_losses1)
     pg_loss = agg_loss(loss_mat=pg_losses, loss_mask=response_mask, loss_agg_mode=loss_agg_mode)
 
@@ -1186,6 +1172,7 @@ def compute_policy_loss_vanilla(
     loss_agg_mode: str = "token-mean",
     config: Optional[ActorConfig] = None,
     rollout_is_weights: torch.Tensor | None = None,
+    top1_log_prob: torch.Tensor | None = None
 ) -> tuple[torch.Tensor, dict[str, Any]]:
     """
     Compute the clipped policy objective and related metrics for PPO.
@@ -1227,47 +1214,94 @@ def compute_policy_loss_vanilla(
         "The lower bound of the clip_ratio_c for dual-clip PPO should be greater than 1.0,"
         + f" but get the value: {clip_ratio_c}."
     )
+    import os
+    PI_OLD_ENABLED = int(os.getenv('PI_OLD_ENABLED', '0'))
+    TOP1_ENABLED = int(os.getenv('TOP1_ENABLED', '0'))
+    if PI_OLD_ENABLED:
+        
+        ppo_kl = verl_F.masked_mean(-(log_prob - old_log_prob), response_mask)
 
-    negative_approx_kl = log_prob - old_log_prob
-    # Clamp negative_approx_kl for stability
-    negative_approx_kl = torch.clamp(negative_approx_kl, min=-20.0, max=20.0)
-    ratio = torch.exp(negative_approx_kl)
-    ppo_kl = verl_F.masked_mean(-negative_approx_kl, response_mask)
+        old_log_prob = torch.log(torch.exp(old_log_prob) + 0.01)
+        negative_approx_kl = log_prob - old_log_prob
+        # Clamp negative_approx_kl for stability
+        negative_approx_kl = torch.clamp(negative_approx_kl, min=-20.0, max=20.0)
+        ratio = torch.exp(negative_approx_kl)
 
-    pg_losses1 = -advantages * ratio
-    if cliprange_low is None:
-        cliprange_low = cliprange
-    if cliprange_high is None:
-        cliprange_high = cliprange
-    pg_losses2 = -advantages * torch.clamp(
-        ratio, 1 - cliprange_low, 1 + cliprange_high
-    )  # - clip(ratio, 1-cliprange, 1+cliprange) * A
-    clip_pg_losses1 = torch.maximum(
-        pg_losses1, pg_losses2
-    )  # max(-ratio * A, -clip(ratio, 1-cliprange, 1+cliprange) * A)
-    pg_clipfrac = verl_F.masked_mean(torch.gt(pg_losses2, pg_losses1).float(), response_mask)
+        pg_losses = -advantages * ratio
 
-    pg_losses3 = -advantages * clip_ratio_c
-    clip_pg_losses2 = torch.min(pg_losses3, clip_pg_losses1)
-    pg_clipfrac_lower = verl_F.masked_mean(
-        torch.gt(clip_pg_losses1, pg_losses3) * (advantages < 0).float(), response_mask
-    )
+        pg_loss = agg_loss(
+            loss_mat=pg_losses, loss_mask=response_mask, loss_agg_mode=loss_agg_mode, **config.global_batch_info
+        )
+        pg_metrics = {
+            "actor/ppo_kl": ppo_kl.detach().item(),
+        }
+        
+    else:
+        if TOP1_ENABLED:
+            print("---------------------------------Top1 Enabled-----------------------------")
+            negative_approx_kl = log_prob - top1_log_prob
+        else:
+            negative_approx_kl = log_prob - old_log_prob
+        # Clamp negative_approx_kl for stability
+        negative_approx_kl = torch.clamp(negative_approx_kl, min=-20.0, max=20.0)
+        ratio = torch.exp(negative_approx_kl)
+        ppo_kl = verl_F.masked_mean(-negative_approx_kl, response_mask)
 
-    pg_losses = torch.where(advantages < 0, clip_pg_losses2, clip_pg_losses1)
 
-    # Apply rollout correction weights if provided
-    if rollout_is_weights is not None:
-        pg_losses = pg_losses * rollout_is_weights
 
-    pg_loss = agg_loss(
-        loss_mat=pg_losses, loss_mask=response_mask, loss_agg_mode=loss_agg_mode, **config.global_batch_info
-    )
+        PIPO_ENABLED = int(os.getenv('PIPO_ENABLED', '0'))
 
-    pg_metrics = {
-        "actor/pg_clipfrac": pg_clipfrac.detach().item(),
-        "actor/ppo_kl": ppo_kl.detach().item(),
-        "actor/pg_clipfrac_lower": pg_clipfrac_lower.detach().item(),
-    }
+        if PIPO_ENABLED != 0:
+            print("------------------------PIPO advantage = 1--------------------------------")
+            advantages = torch.where(advantages <= 0, advantages*0, (advantages*0+1) * torch.exp(log_prob.detach()))
+
+
+        pg_losses1 = -advantages * ratio
+        if cliprange_low is None:
+            cliprange_low = cliprange
+        if cliprange_high is None:
+            cliprange_high = cliprange
+        pg_losses2 = -advantages * torch.clamp(
+            ratio, 1 - cliprange_low, 1 + cliprange_high
+        )  # - clip(ratio, 1-cliprange, 1+cliprange) * A
+        clip_pg_losses1 = torch.maximum(
+            pg_losses1, pg_losses2
+        )  # max(-ratio * A, -clip(ratio, 1-cliprange, 1+cliprange) * A)
+        pg_clipfrac = verl_F.masked_mean(torch.gt(pg_losses2, pg_losses1).float(), response_mask)
+
+        pg_losses3 = -advantages * clip_ratio_c
+        clip_pg_losses2 = torch.min(pg_losses3, clip_pg_losses1)
+        pg_clipfrac_lower = verl_F.masked_mean(
+            torch.gt(clip_pg_losses1, pg_losses3) * (advantages < 0).float(), response_mask
+        )
+
+        pg_losses = torch.where(advantages < 0, clip_pg_losses2, clip_pg_losses1)
+
+        # Apply rollout correction weights if provided
+        if rollout_is_weights is not None:
+            print("[Debugging]----------- TIS is enabled--------------------")
+            pg_losses = pg_losses * rollout_is_weights
+
+
+        ADV_TYPE = int(os.getenv('ADV_TYPE', '0'))
+        if ADV_TYPE == 0:
+            pg_losses = torch.where(advantages < 0, clip_pg_losses2, clip_pg_losses1)
+        elif ADV_TYPE == 1: # only want the bad samples
+            pg_losses = torch.where(advantages < 0, clip_pg_losses2, clip_pg_losses1*0)
+        else:   # only want the good samples
+            print(f"-----------------grpo advantage > 0--------------------------------")
+            pg_losses = torch.where(advantages < 0, clip_pg_losses2*0, clip_pg_losses1)
+
+
+        pg_loss = agg_loss(
+            loss_mat=pg_losses, loss_mask=response_mask, loss_agg_mode=loss_agg_mode, **config.global_batch_info
+        )
+
+        pg_metrics = {
+            "actor/pg_clipfrac": pg_clipfrac.detach().item(),
+            "actor/ppo_kl": ppo_kl.detach().item(),
+            "actor/pg_clipfrac_lower": pg_clipfrac_lower.detach().item(),
+        }
     return pg_loss, pg_metrics
 
 

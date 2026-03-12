@@ -267,7 +267,9 @@ class DataParallelPPOActor(BasePPOActor):
                         labels=input_ids_rmpad_rolled,
                         inplace_backward=inplace_backward,
                     )
-
+                    # [Zhijie]
+                    top1_probs_rmpad = torch.nn.functional.log_softmax(logits_rmpad, dim=-1).max(dim=-1).values
+                    
                     # compute entropy
                     if calculate_entropy:
                         # ((total_nnz / sp) + pad)
@@ -310,6 +312,8 @@ class DataParallelPPOActor(BasePPOActor):
 
                 if is_mask_all_zero:
                     log_probs = log_probs[:0]
+                    if top1_probs_rmpad != None:
+                        top1_probs_rmpad = top1_probs_rmpad[:0]
                     if calculate_entropy:
                         entropy_rmpad = entropy_rmpad[:0]
 
@@ -328,8 +332,17 @@ class DataParallelPPOActor(BasePPOActor):
                         batch=batch_size,
                         seqlen=seqlen,
                     )
+
                 full_log_probs = pad_input(
                     hidden_states=log_probs.unsqueeze(-1),
+                    indices=indices,
+                    batch=batch_size,
+                    seqlen=seqlen,
+                )
+
+                # [zhijie] add padding back before return
+                full_top1_probs = pad_input(
+                    hidden_states=top1_probs_rmpad.unsqueeze(-1),
                     indices=indices,
                     batch=batch_size,
                     seqlen=seqlen,
@@ -342,7 +355,8 @@ class DataParallelPPOActor(BasePPOActor):
                     # (bsz, response_length)
                     sum_pi_squared = full_sum_pi_squared.squeeze(-1)[:, -response_length - 1 : -1]
                 log_probs = full_log_probs.squeeze(-1)[:, -response_length - 1 : -1]  # (bsz, response_length)
-
+                top1_probs = full_top1_probs.squeeze(-1)[:, -response_length - 1 : -1]  # (bsz, response_length)
+            # [Zhijie] wont get in here
             else:  # not using rmpad and no ulysses sp
                 extra_args = {}
                 if self.use_fused_kernels:
@@ -368,6 +382,9 @@ class DataParallelPPOActor(BasePPOActor):
                     logits.div_(temperature)
                     logits = logits[:, -response_length - 1 : -1, :]  # (bsz, response_length, vocab_size)
                     log_probs = logprobs_from_logits(logits, micro_batch["responses"])
+                                        # [Zhijie]
+                    top1_probs = torch.nn.functional.log_softmax(logits, dim=-1).max(dim=-1).values
+                    
                     if calculate_entropy:
                         if not self.config.entropy_checkpointing:
                             entropy = verl_F.entropy_from_logits(logits)  # (bsz, response_length)
@@ -381,7 +398,7 @@ class DataParallelPPOActor(BasePPOActor):
                             else torch.utils.checkpoint.checkpoint(self.calculate_sum_pi_squared_from_logits, logits)
                         )
 
-            outputs = {"log_probs": log_probs}
+            outputs = {"log_probs": log_probs, "top1_log_probs":top1_probs.detach()}
             if calculate_entropy:
                 outputs["entropys"] = entropy
             if calculate_sum_pi_squared:
@@ -589,6 +606,9 @@ class DataParallelPPOActor(BasePPOActor):
                         model_inputs, temperature=temperature, calculate_entropy=calculate_entropy
                     )
                     log_prob = outputs["log_probs"]
+                    # [Zhijie]
+                    top1_log_prob = outputs["top1_log_probs"]
+
                     entropy = outputs["entropys"] if calculate_entropy else None
 
                     # for fully_async_policy
@@ -620,6 +640,7 @@ class DataParallelPPOActor(BasePPOActor):
                         loss_agg_mode=loss_agg_mode,
                         config=self.config,
                         rollout_is_weights=rollout_is_weights,
+                        top1_log_prob=top1_log_prob
                     )
                     micro_batch_metrics.update(pg_metrics)
 
