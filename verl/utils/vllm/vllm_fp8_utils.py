@@ -241,12 +241,12 @@ def quant_weights(weights, model, quant_config, dtype=torch.bfloat16):
     is_mxfp8_npu = is_mxfp8_vllm_ascend(quant_config)
 
     weight_block_size = None
-    if hasattr(quant_config, "weight_block_size"):
-        weight_block_size = quant_config.weight_block_size
-    elif is_mxfp8_npu:
+    if is_mxfp8_npu:
         weight_block_size = MXFP8_BLOCK_QUANT_KWARGS["weight_block_size"]
     else:
-        raise ValueError("Currently only support blockwise quantization, please set weight_block_size in quant_config")
+        if quant_config.weight_block_size is None:
+            raise ValueError("Currently only support blockwise quantization, please set weight_block_size in quant_config")
+        weight_block_size = quant_config.weight_block_size
 
     is_vllm_11_or_later = version.parse(vllm.__version__) >= version.parse("0.11.0")
 
