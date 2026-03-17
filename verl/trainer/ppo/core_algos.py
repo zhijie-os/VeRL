@@ -1308,6 +1308,7 @@ def compute_policy_loss_vanilla(
     """
     # 1. Define STAPO thresholds
     tau_p = 0.002 # from the paper
+    import math
     tau_p_log = math.log(tau_p) # Do this once (equals roughly -6.21)
     
     # We also need the entropy threshold (e.g., bottom 80%)
