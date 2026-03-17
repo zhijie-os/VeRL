@@ -590,7 +590,7 @@ class DataParallelPPOActor(BasePPOActor):
                     )
                     log_prob = outputs["log_probs"]
                     entropy = outputs["entropys"] if calculate_entropy else None
-
+                    entropy = entropy.detach()
                     # for fully_async_policy
                     if hasattr(self.config, "use_rollout_log_probs") and self.config.use_rollout_log_probs:
                         old_log_prob = model_inputs["old_log_probs"]
