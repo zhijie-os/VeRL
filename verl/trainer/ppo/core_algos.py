@@ -1282,6 +1282,7 @@ def compute_policy_loss_vanilla(
     loss_agg_mode: str = "token-mean",
     config: Optional[ActorConfig] = None,
     rollout_is_weights: torch.Tensor | None = None,
+    entropy: torch.Tensor
 ) -> tuple[torch.Tensor, dict[str, Any]]:
     """
     Compute the clipped policy objective and related metrics for PPO.
@@ -1305,6 +1306,21 @@ def compute_policy_loss_vanilla(
         rollout_log_probs: `(torch.Tensor)`:
             log probabilities of actions under the rollout policy, shape (batch_size, response_length).
     """
+    # 1. Define STAPO thresholds
+    tau_p = 0.002 # from the paper
+    tau_p_log = math.log(tau_p) # Do this once (equals roughly -6.21)
+    
+    # We also need the entropy threshold (e.g., bottom 80%)
+    # Note: You might want to calculate this quantile dynamically per batch
+    tau_h = torch.quantile(entropy[response_mask.bool()], 0.80) 
+
+    # 2. Identify Spurious Tokens
+    # Condition: Advantage > 0 AND log_prob < log(tau_p) AND entropy < tau_h
+    is_spurious = (advantages > 0) & (log_prob < tau_p_log) & (entropy < tau_h)
+    
+    # 3. Create the S2T Mask (1 = keep, 0 = silence)
+    # We combine it with the existing response_mask (which likely handles padding)
+    stapo_mask = (~is_spurious).float() * response_mask.float()
 
     assert config is not None
     assert not isinstance(config, AlgoConfig)
@@ -1356,7 +1372,7 @@ def compute_policy_loss_vanilla(
         pg_losses = pg_losses * rollout_is_weights
 
     pg_loss = agg_loss(
-        loss_mat=pg_losses, loss_mask=response_mask, loss_agg_mode=loss_agg_mode, **config.global_batch_info
+        loss_mat=pg_losses, loss_mask=stapo_mask, loss_agg_mode=loss_agg_mode, **config.global_batch_info
     )
 
     pg_metrics = {
