@@ -119,12 +119,14 @@ def is_fp8_weight(name, model):
     return name in fp8_state.fp8_param_names
 
 def is_mxfp8_vllm_ascend(quant_config):
-    from vllm_ascend.quantization.quant_config import AscendQuantConfig
-    if isinstance(quant_config, AscendQuantConfig):
+    from vllm_ascend.quantization.modelslim_config import AscendModelSlimConfig
+    if isinstance(quant_config, AscendModelSlimConfig):
         # Check if the specific quantization method is MXFP8
         # AscendQuantConfig stores config in quant_description
         quant_method = quant_config.quant_description.get("quant_method")
+        print(f"[+] quant_method: {quant_method}")
         return quant_method in ["ascend"]
+    return False
 
 def restore_mxfp8_weights_for_loading(model):
     for name, module in model.named_modules():
