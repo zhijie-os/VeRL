@@ -131,7 +131,6 @@ def restore_mxfp8_weights_for_loading(model):
     for name, module in model.named_modules():
         if hasattr(module, '_mxfp8_transformed') and hasattr(module, 'quant_method') \
             and hasattr(module.quant_method, 'quant_method') and hasattr(module.quant_method.quant_method, 'restore_weights_for_rl_loading'):
-            logger.info(f"Restoring MXFP8 weights for module: {name}")
             module.quant_method.quant_method.restore_weights_for_rl_loading(module)
 
 def apply_mxfp8_transformation_after_loading(model):
@@ -311,7 +310,6 @@ def load_quanted_weights(weights, model_runner):
 
     if is_mxfp8_npu:
         # Re-apply MXFP8 transformations after weight loading
-        logger.info("MXFP8 NPU: re-applying transformations after weight load")
         apply_mxfp8_transformation_after_loading(model)
     
     return loaded_params
