@@ -252,7 +252,7 @@ def quant_weights(weights, model, quant_config, dtype=torch.bfloat16):
 
     # vLLM v0.11-v0.12 renamed weight_scale_inv → weight_scale in process_weights_after_loading,
     # so load_weights expects "_scale" suffix. v0.14+ keeps weight_scale_inv, so expects "_scale_inv".
-    _use_scale_not_scale_inv = is_mxfp8_npu or version.parse("0.11.0") <= version.parse(vllm.__version__) < version.parse("0.14.0")
+    _use_scale_not_scale_inv = version.parse("0.11.0") <= version.parse(vllm.__version__) < version.parse("0.14.0")
 
     for k, v in weights:
         if not is_fp8_weight(k, model):
@@ -281,7 +281,8 @@ def quant_weights(weights, model, quant_config, dtype=torch.bfloat16):
         if _use_scale_not_scale_inv and "expert" not in k:
             yield (k + "_scale", param_scale)
         else:
-            yield (k + "_scale_inv", param_scale)
+            if not is_mxfp8_npu:
+                yield (k + "_scale_inv", param_scale)
 
         # Explicitly delete original tensor reference to help GC
         del v, param_lp, param_scale
