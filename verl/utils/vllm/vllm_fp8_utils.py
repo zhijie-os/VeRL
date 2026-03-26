@@ -119,9 +119,11 @@ def is_fp8_weight(name, model):
                 fp8_state.fp8_param_names.add(name)
     return name in fp8_state.fp8_param_names
 
+
 def is_mxfp8_vllm_ascend(quant_config):
     try:
         from vllm_ascend.quantization.modelslim_config import AscendModelSlimConfig
+
         if isinstance(quant_config, AscendModelSlimConfig):
             quant_method = quant_config.quant_description.get("quant_method")
             return quant_method in ["ascend"]
@@ -130,11 +132,17 @@ def is_mxfp8_vllm_ascend(quant_config):
         # vllm_ascend not installed, so this can't be an Ascend MXFP8 config
         return False
 
+
 def restore_mxfp8_weights_for_loading(model):
     for name, module in model.named_modules():
-        if hasattr(module, '_mxfp8_transformed') and hasattr(module, 'quant_method') \
-            and hasattr(module.quant_method, 'quant_method') and hasattr(module.quant_method.quant_method, 'restore_weights_for_rl_loading'):
+        if (
+            hasattr(module, "_mxfp8_transformed")
+            and hasattr(module, "quant_method")
+            and hasattr(module.quant_method, "quant_method")
+            and hasattr(module.quant_method.quant_method, "restore_weights_for_rl_loading")
+        ):
             module.quant_method.quant_method.restore_weights_for_rl_loading(module)
+
 
 def apply_mxfp8_transformation_after_loading(model):
     """Re-apply MXFP8 transformations after weight loading.
@@ -152,10 +160,13 @@ def apply_mxfp8_transformation_after_loading(model):
         return
 
     for name, module in model.named_modules():
-        if (isinstance(module, LinearBase) or isinstance(module, FusedMoE)) and hasattr(module, '_mxfp8_original_shapes'):
-            if hasattr(module, 'quant_method') and hasattr(module.quant_method, 'process_weights_after_loading'):
+        if (isinstance(module, LinearBase) or isinstance(module, FusedMoE)) and hasattr(
+            module, "_mxfp8_original_shapes"
+        ):
+            if hasattr(module, "quant_method") and hasattr(module.quant_method, "process_weights_after_loading"):
                 logger.debug(f"Applying MXFP8 transformation for module: {name}")
                 module.quant_method.process_weights_after_loading(module)
+
 
 def npu_scaled_mxfp8_blockwise(
     data_hp,
@@ -234,7 +245,7 @@ def quant_weights(weights, model, quant_config, dtype=torch.bfloat16):
     Yields:
         Tuples of (name, tensor) for each weight and its scale
     """
-    
+
     is_mxfp8_npu = is_mxfp8_vllm_ascend(quant_config)
 
     weight_block_size = None
@@ -242,7 +253,9 @@ def quant_weights(weights, model, quant_config, dtype=torch.bfloat16):
         weight_block_size = MXFP8_BLOCK_QUANT_KWARGS["weight_block_size"]
     else:
         if quant_config.weight_block_size is None:
-            raise ValueError("Currently only support blockwise quantization, please set weight_block_size in quant_config")
+            raise ValueError(
+                "Currently only support blockwise quantization, please set weight_block_size in quant_config"
+            )
         weight_block_size = quant_config.weight_block_size
 
     # vLLM v0.11-v0.12 renamed weight_scale_inv → weight_scale in process_weights_after_loading,
@@ -259,9 +272,9 @@ def quant_weights(weights, model, quant_config, dtype=torch.bfloat16):
             logger.debug(f"Quantizing to FP8 blockwise: {k}")
         if is_mxfp8_npu:
             param_lp, param_scale = npu_scaled_mxfp8_blockwise(
-                    v.to(dtype),
-                    weight_block_size=weight_block_size,
-                )
+                v.to(dtype),
+                weight_block_size=weight_block_size,
+            )
         else:
             param_lp, param_scale = scaled_fp8_blockwise(
                 v.to(dtype),
@@ -314,7 +327,7 @@ def load_quanted_weights(weights, model_runner):
     if is_mxfp8_npu:
         # Re-apply MXFP8 transformations after weight loading
         apply_mxfp8_transformation_after_loading(model)
-    
+
     return loaded_params
 
 
