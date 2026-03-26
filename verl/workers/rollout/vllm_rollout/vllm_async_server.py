@@ -222,9 +222,6 @@ class vLLMHttpServer:
 
         quantization, hf_overrides = self._apply_quantization()
 
-        if quant_config_kwargs is not None:
-            hf_overrides["quantization_config"] = quant_config_kwargs
-
         compilation_config = engine_kwargs.pop("compilation_config", None) or {}
         if isinstance(compilation_config, str):
             compilation_config = json.loads(compilation_config)
@@ -837,6 +834,7 @@ class vLLMHttpServer:
                 from verl.utils.vllm.vllm_fp8_utils import MXFP8_BLOCK_QUANT_KWARGS
                 # quant_config_kwargs = dict(MXFP8_BLOCK_QUANT_KWARGS)
                 # Use "ascend" as the vllm quantization parameter
+                hf_overrides["quantization_config"] = dict(MXFP8_BLOCK_QUANT_KWARGS)
                 quantization = "ascend"
 
         if quantization is not None and self.config.quantization_config_file is not None:
