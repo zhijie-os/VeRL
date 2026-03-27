@@ -458,9 +458,16 @@ class DataParallelPPOActor(BasePPOActor):
         non_tensor_select_keys = ["multi_modal_inputs"] if has_multi_modal_inputs else []
         if self.use_prefix_grouper:
             select_keys += [k for k in ["prompts", "response_mask"] if k in data.batch]
+            print('============response_mask in=================')
+            ###########dyy打印值######################
+            if "response_mask" in data.batch:
+                response_mask = data.batch["response_mask"]
+                print(f"[DEBUG] response_mask shape: {response_mask.shape}, device: {response_mask.device}")
+                print(f"[DEBUG] response_mask first 2 samples (first 10 tokens):\n{response_mask[:2, :10].cpu()}")
+            ##########################################
             if "uid" in data.non_tensor_batch:
                 non_tensor_select_keys.append("uid")
-
+        print('============response_mask out=================')
         data = data.select(batch_keys=select_keys, non_tensor_batch_keys=non_tensor_select_keys)
 
         if use_dynamic_bsz:
@@ -480,6 +487,7 @@ class DataParallelPPOActor(BasePPOActor):
                     model_inputs, temperature=temperature, calculate_entropy=calculate_entropy
                 )
             log_probs_lst.append(outputs["log_probs"])
+            ##response_mask = data.batch["response_mask"]
             if calculate_entropy:
                 entropy_lst.append(outputs["entropys"])
             if calculate_sum_pi_squared:
@@ -606,6 +614,28 @@ class DataParallelPPOActor(BasePPOActor):
                     # Extract pre-computed rollout correction weights if present
                     # Weights are computed centrally in trainer and added when algorithm.rollout_is=True
                     rollout_is_weights = model_inputs.get("rollout_is_weights", None)
+                    rollout_log_prob = model_inputs.get("rollout_log_probs", None)
+
+                    import os
+                    ACRL = os.environ.get('ACRL', 'None')
+
+                    if ACRL == "ACRL":
+                        rollout_is_weights = self.compute_rollout_correction_ACRL(
+                            old_log_prob=old_log_prob,
+                            rollout_log_prob=rollout_log_prob,
+                            log_prob=log_prob, 
+                            advantages=advantages,
+                            response_mask=response_mask,
+                        )
+                    if ACRL == "ACRL2":
+                        rollout_is_weights = self.compute_rollout_correction_ACRL2(
+                            old_log_prob=old_log_prob,
+                            rollout_log_prob=rollout_log_prob,
+                            log_prob=log_prob, 
+                            advantages=advantages,
+                            response_mask=response_mask,
+                        )
+
 
                     # gpg -> verl.trainer.ppo.core_algos.compute_policy_loss_gpg
                     # clip_cov -> verl.trainer.ppo.core_algos.compute_policy_loss_clip_cov
@@ -624,7 +654,7 @@ class DataParallelPPOActor(BasePPOActor):
                     micro_batch_metrics.update(pg_metrics)
 
                     # Skip if using bypass_mode loss (metrics already computed in pg_metrics)
-                    rollout_log_prob = model_inputs.get("rollout_log_probs", None)
+                    
                     if loss_mode != "bypass_mode" and rollout_log_prob is not None:
                         # Compute metrics using CURRENT policy π_θ vs π_rollout
                         # Tracks evolving off-policy gap as π_θ updates during mini-batch training
@@ -674,3 +704,110 @@ class DataParallelPPOActor(BasePPOActor):
                 append_to_dict(metrics, mini_batch_metrics)
         self.actor_optimizer.zero_grad()
         return metrics
+
+
+    def compute_rollout_correction_ACRL(
+        self,
+        old_log_prob: torch.Tensor,
+        rollout_log_prob: torch.Tensor,
+        log_prob: torch.Tensor,
+        advantages: torch.Tensor,
+        response_mask: torch.Tensor,
+    ) -> torch.Tensor:
+        # print(f"===========================ACRL==================")
+        rollout_probs = torch.exp(rollout_log_prob)
+        train_probs = torch.exp(log_prob.detach())
+        rollout_probs_diff = torch.abs(rollout_probs - train_probs)
+        rollout_probs_diff = torch.masked_select(rollout_probs_diff, response_mask.bool())
+        rollout_probs_diff_mean = torch.mean(rollout_probs_diff)
+        # print(f"=========================rollout_probs_diff_mean:{rollout_probs_diff_mean}=====fww")
+        rollout_probs_diff_mean_ref = 0.054
+        # gamma = rollout_probs_diff_mean_ref * 25.0
+        gamma = 0.65 # 0.65
+
+        imp_ratio_cap_max = 5.0 # 3.0
+        imp_ratio_cap_min = 0.0
+        imp_ratio = torch.exp(old_log_prob - rollout_log_prob)
+
+        probs_diff_ratio = rollout_probs_diff_mean/rollout_probs_diff_mean_ref
+        # probs_diff_ratio = torch.clamp(probs_diff_ratio, min=0.2, max=5.0)
+        # probs_diff_ratio = torch.clamp(probs_diff_ratio, min=0.1, max=10.0)
+        ratio_quadrant_34 = imp_ratio ** ((probs_diff_ratio - 1.0)*gamma)
+        ratio_quadrant_12 = imp_ratio ** ((1.0 - probs_diff_ratio)*gamma)
+
+        # print(f"=========================ratio_quadrant_34:{ratio_quadrant_34}====ratio_quadrant_12:{ratio_quadrant_12}=fww")
+
+        ratio_quadrant_34 = torch.clamp(ratio_quadrant_34, min=imp_ratio_cap_min, max=imp_ratio_cap_max)
+
+        ratio_quadrant_12 = torch.clamp(ratio_quadrant_12, min=imp_ratio_cap_min, max=imp_ratio_cap_max)
+
+        pos_mask1 = torch.logical_and(rollout_probs - train_probs > 0.0, advantages > 0.0)
+        boost_ratio1 = pos_mask1 * ratio_quadrant_12 # ratio_quadrant_12 < 1 提升奖励
+
+        pos_mask2 = torch.logical_and(rollout_probs - train_probs < 0.0, advantages > 0.0)
+        boost_ratio2 = pos_mask2 * ratio_quadrant_12 # ratio_quadrant_12 > 1 降低奖励
+
+        pos_mask3 = torch.logical_and(rollout_probs - train_probs < 0.0, advantages < 0.0)
+        boost_ratio3 = pos_mask3 * ratio_quadrant_34 # ratio_quadrant_34 > 1 加重惩罚
+
+        pos_mask4 = torch.logical_and(rollout_probs - train_probs > 0.0, advantages < 0.0)
+        boost_ratio4 = pos_mask4 * ratio_quadrant_34 # ratio_quadrant_34 < 1 减轻惩罚
+
+        boost_ratio = boost_ratio1 + boost_ratio2 + boost_ratio3 + boost_ratio4
+        pos_mask = pos_mask1 | pos_mask2 | pos_mask3 | pos_mask4
+
+        rollout_is_weights = torch.where(pos_mask, boost_ratio, torch.ones_like(boost_ratio))
+        return rollout_is_weights
+
+    def compute_rollout_correction_ACRL2(
+        self,
+        old_log_prob: torch.Tensor,
+        rollout_log_prob: torch.Tensor,
+        log_prob: torch.Tensor,
+        advantages: torch.Tensor,
+        response_mask: torch.Tensor,
+    ) -> torch.Tensor:
+        # print(f"===========================ACRL2==================")
+        rollout_probs = torch.exp(rollout_log_prob)
+        train_probs = torch.exp(log_prob.detach())
+        rollout_probs_diff = torch.abs(rollout_probs - train_probs)
+        rollout_probs_diff = torch.masked_select(rollout_probs_diff, response_mask.bool())
+        rollout_probs_diff_mean = torch.mean(rollout_probs_diff)
+        # print(f"=========================rollout_probs_diff_mean:{rollout_probs_diff_mean}=====fww")
+        rollout_probs_diff_mean_ref = 0.05 
+        # gamma = rollout_probs_diff_mean_ref * 25.0
+        gamma = 0.5 # 0.65
+
+        imp_ratio_cap_max = 3.0 # 3.0
+        imp_ratio_cap_min = 0.0
+        imp_ratio = torch.exp(old_log_prob - rollout_log_prob)
+
+        probs_diff_ratio = rollout_probs_diff_mean/rollout_probs_diff_mean_ref
+        # probs_diff_ratio = torch.clamp(probs_diff_ratio, min=0.2, max=5.0)
+        # probs_diff_ratio = torch.clamp(probs_diff_ratio, min=0.1, max=10.0)
+        ratio_quadrant_34 = imp_ratio ** ((probs_diff_ratio - 1.0)*gamma)
+        ratio_quadrant_12 = imp_ratio ** ((1.0 - probs_diff_ratio)*gamma)
+
+        # print(f"=========================ratio_quadrant_34:{ratio_quadrant_34}====ratio_quadrant_12:{ratio_quadrant_12}=fww")
+
+        ratio_quadrant_34 = torch.clamp(ratio_quadrant_34, min=imp_ratio_cap_min, max=imp_ratio_cap_max)
+
+        ratio_quadrant_12 = torch.clamp(ratio_quadrant_12, min=imp_ratio_cap_min, max=imp_ratio_cap_max)
+
+        pos_mask1 = torch.logical_and(rollout_probs - train_probs > 0.0, advantages > 0.0)
+        boost_ratio1 = pos_mask1 * ratio_quadrant_12 # ratio_quadrant_12 < 1 提升奖励
+
+        pos_mask2 = torch.logical_and(rollout_probs - train_probs < 0.0, advantages > 0.0)
+        boost_ratio2 = pos_mask2 * ratio_quadrant_12 # ratio_quadrant_12 > 1 降低奖励
+
+        pos_mask3 = torch.logical_and(rollout_probs - train_probs < 0.0, advantages < 0.0)
+        boost_ratio3 = pos_mask3 * ratio_quadrant_34 # ratio_quadrant_34 > 1 加重惩罚
+
+        pos_mask4 = torch.logical_and(rollout_probs - train_probs > 0.0, advantages < 0.0)
+        boost_ratio4 = pos_mask4 * ratio_quadrant_34 # ratio_quadrant_34 < 1 减轻惩罚
+
+        boost_ratio = boost_ratio1 + boost_ratio2 + boost_ratio3 + boost_ratio4
+        pos_mask = pos_mask1 | pos_mask2 | pos_mask3 | pos_mask4
+
+        rollout_is_weights = torch.where(pos_mask, boost_ratio, torch.ones_like(boost_ratio))
+        return rollout_is_weights
